@@ -159,6 +159,36 @@ jspb.Map.prototype.toObject = function(includeInstance, valueToObject) {
 
 
 /**
+ * Returns the Map formatted as a plain javascript object, suitable for the
+ * toJSONObject() form of a message.
+ *
+ * @param {!function(Array<T>,number,Array<T>): Object} mapFn
+ *    a function that maps a property name and value to its corresponding proto3 compatible JSON format
+ * @return {!Object}
+ * @template T
+*/
+jspb.Map.prototype.toJSONObjectMap = function (mapFn) {
+  goog.asserts.assert(typeof mapFn === 'function', "expected a map function, but found \"" + (typeof mapFn).toString() + "\"");
+
+  var result = {};
+  var strKeys = this.stringKeys_();
+  strKeys.sort();
+  for (var i = 0; i < strKeys.length; i++) {
+    var entry = this.map_[strKeys[i]];
+    this.wrapEntry_(entry);
+    var valueWrapper = /** @type {V|undefined} */ (entry.valueWrapper);
+    var pair = [entry.key, entry.value];
+    if (valueWrapper) {
+      pair[1] = valueWrapper;
+    }
+    pair = mapFn(pair, i, strKeys);
+    result[pair[0]] = pair[1]
+}
+
+  return result;
+};
+
+/**
  * Returns a Map from the given array of key-value pairs when the values are of
  * message type. The values in the array must match the format returned by their
  * message type's toObject() method.
