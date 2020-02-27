@@ -188,6 +188,17 @@ jspb.Message.GENERATE_FROM_OBJECT = goog.define(
 
 
 /**
+* @define {boolean} Whether to generate toJSONObject methods for objects. Turn
+*     this off, if you do not want toJSONObject to be ever used in your project.
+*     When turning off this flag, consider adding a conformance test that bans
+*     calling toJSONObject. Enabling this will disable the JSCompiler's ability to
+*     dead code eliminate fields used in protocol buffers that are never used
+*     in an application.
+*/
+jspb.Message.GENERATE_TO_JSON_OBJECT =
+  goog.define('jspb.Message.GENERATE_TO_JSON_OBJECT', true);
+
+/**
  * @define {boolean} Whether to generate toString methods for objects. Turn
  *     this off if you do not use toString in your project and want to trim it
  *     from the compiled JS.
@@ -524,7 +535,30 @@ jspb.Message.toObjectList = function(field, toObjectFn, opt_includeInstance) {
   return result;
 };
 
+/**
+ * Converts a JsPb repeated message field into an object list compatible with canonical JSON proto3 format.
+ * @param {!Array<T>} field The repeated message field to be
+ *     converted.
+ * @param {!function(Object,number,Array<T>): Object} mapFn 
+ *   a function that maps a field value to its corresponding proto3 compatible JSON format
+ * @return {!Array<Object>} An array of converted message objects.
+ * @template T
+ */
+jspb.Message.mapFieldList = function (field, mapFn) {
+  if (field === null) {
+    return [];
+  }
 
+  goog.asserts.assert(typeof mapFn === 'function', "expected a map function, but found \"" + (typeof mapFn).toString() + "\"");
+
+  // Not using goog.array.map in the generated code to keep it small.
+  // And not using it here to avoid a function call.
+  var result = [];
+  for (var i = 0; i < field.length; i++) {
+    result[i] = mapFn(field[i], i, field);
+  }
+  return result;
+};
 /**
  * Adds a proto's extension data to a Soy rendering object.
  * @param {!jspb.Message} proto The proto whose extensions to convert.

@@ -43,6 +43,7 @@ var group2Protos = [
   'proto3_test.proto',
   'test2.proto',
   'test4.proto',
+  'testjson.proto',
   'commonjs/test7/test7.proto',
 ];
 

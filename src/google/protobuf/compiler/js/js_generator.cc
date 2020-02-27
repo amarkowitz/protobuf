@@ -477,7 +477,7 @@ bool IgnoreOneof(const OneofDescriptor* oneof) {
 
 std::string JSIdent(const GeneratorOptions& options,
                     const FieldDescriptor* field, bool is_upper_camel,
-                    bool is_map, bool drop_list) {
+                    bool drop_map, bool drop_list) {
   std::string result;
   if (field->type() == FieldDescriptor::TYPE_GROUP) {
     result = is_upper_camel
@@ -487,7 +487,7 @@ std::string JSIdent(const GeneratorOptions& options,
     result = is_upper_camel ? ToUpperCamel(ParseLowerUnderscore(field->name()))
                             : ToLowerCamel(ParseLowerUnderscore(field->name()));
   }
-  if (is_map || field->is_map()) {
+  if (!drop_map && field->is_map()) {
     // JSPB-style or proto3-style map.
     result += "Map";
   } else if (!drop_list && field->is_repeated()) {
@@ -498,11 +498,11 @@ std::string JSIdent(const GeneratorOptions& options,
 }
 
 std::string JSObjectFieldName(const GeneratorOptions& options,
-                              const FieldDescriptor* field) {
+                              const FieldDescriptor* field, bool drop_suffixes = false) {
   std::string name = JSIdent(options, field,
                              /* is_upper_camel = */ false,
-                             /* is_map = */ false,
-                             /* drop_list = */ false);
+                             /* drop_map = */ drop_suffixes,
+                             /* drop_list = */ drop_suffixes);
   if (IsReserved(name)) {
     name = "pb_" + name;
   }
@@ -531,7 +531,7 @@ std::string JSGetterName(const GeneratorOptions& options,
                          bool drop_list = false) {
   std::string name = JSIdent(options, field,
                              /* is_upper_camel = */ true,
-                             /* is_map = */ false, drop_list);
+                             /* drop_map = */ false, drop_list);
   if (field->type() == FieldDescriptor::TYPE_BYTES) {
     std::string suffix = JSByteGetterSuffix(bytes_mode);
     if (!suffix.empty()) {
@@ -1995,6 +1995,410 @@ void Generator::GenerateClassesAndEnums(const GeneratorOptions& options,
   }
 }
 
+class CanonicalJSONToObject {
+  // generates a function that produces a canonical json representation of the
+  // proto. documentation for the format can be found here:
+  //   https://developers.google.com/protocol-buffers/docs/proto3#json
+ public:
+  static void Generate(const GeneratorOptions& options, io::Printer* printer,
+                       const Descriptor* desc) {
+    printer->Print(
+        "\n\n"
+        "if (jspb.Message.GENERATE_TO_JSON_OBJECT) {\n");
+
+    printer->Indent();
+    {
+      printer->Print(
+          "$classname$.prototype.$funcname$ = function(includeDefaults) {\n",
+          "classname", GetMessagePath(options, desc), "funcname",
+          options.json_to_object_name);
+
+      printer->Indent();
+      {
+        printer->Print("var f, obj = {};");
+        printer->Print("\n\n");
+        GenerateFields(options, printer, desc);
+        printer->Print("\n");
+        printer->Print("return obj;\n");
+        printer->Outdent();
+      }
+
+      printer->Print("};\n");
+      printer->Outdent();
+    }
+
+    printer->Print("};\n\n");
+  }
+
+ private:
+  static void GenerateFields(const GeneratorOptions& options,
+                             io::Printer* printer, const Descriptor* desc) {
+    for (int i = 0; i < desc->field_count(); i++) {
+      const FieldDescriptor* field = desc->field(i);
+      if (IgnoreField(field)) {
+        continue;
+      }
+
+      GenerateFieldAsg(options, printer, field);
+
+      printer->Print(";\n");
+    }
+  };
+
+  static void GenerateJSONSerializeCondition(const GeneratorOptions& options,
+                                             io::Printer* printer,
+                                             const FieldDescriptor* field) {
+    // Print an `if (condition)` statement that evaluates to true if the field
+    // is expected to be in the resulting JSON object.
+    if (field->is_map()) {
+      printer->Print("if (includeDefaults || (f && f.getLength() > 0)) {");
+    } else if (field->is_repeated()) {
+      printer->Print("if (includeDefaults || (f && f.length > 0)) {");
+    } else {
+      if (HasFieldPresence(options, field)) {
+        printer->Print("if (includeDefaults || f) {");
+      } else {
+        // No field presence: serialize onto the wire only if value is
+        // non-default.  Defaults are documented here:
+        // https://goto.google.com/lhdfm
+        switch (field->cpp_type()) {
+          case FieldDescriptor::CPPTYPE_INT32:
+          case FieldDescriptor::CPPTYPE_INT64:
+          case FieldDescriptor::CPPTYPE_UINT32:
+          case FieldDescriptor::CPPTYPE_UINT64: {
+            if (IsIntegralFieldWithStringJSType(field)) {
+              // We can use `parseInt` here even though it will not be precise
+              // for 64-bit quantities because we are only testing for
+              // zero/nonzero, and JS numbers (64-bit floating point values,
+              // i.e., doubles) are integer-precise in the range that includes
+              // zero.
+              printer->Print("if (includeDefaults || parseInt(f, 10) !== 0) {");
+            } else {
+              printer->Print("if (includeDefaults || f !== 0) {");
+            }
+            break;
+          }
+
+          case FieldDescriptor::CPPTYPE_ENUM:
+            printer->Print("if (includeDefaults || (f && f !== 0)) {");
+            break;
+          case FieldDescriptor::CPPTYPE_FLOAT:
+          case FieldDescriptor::CPPTYPE_DOUBLE:
+            printer->Print("if (includeDefaults || f !== 0.0) {");
+            break;
+          case FieldDescriptor::CPPTYPE_BOOL:
+            printer->Print("if (includeDefaults || f) {");
+            break;
+          case FieldDescriptor::CPPTYPE_STRING:
+            printer->Print("if (includeDefaults || (f && f.length > 0)) {");
+            break;
+          default:
+            assert(false);
+            break;
+        }
+      }
+    }
+  };
+
+  static void GenerateFieldAsg(const GeneratorOptions& options,
+                               io::Printer* printer,
+                               const FieldDescriptor* field) {
+    // if the use has specified a json_name, use that.  If not, generate a
+    // lowerCamelCase string for the field name.
+    const std::string field_name =
+        field->has_json_name() ? field->json_name()
+                               : JSObjectFieldName(options, field, true);
+
+    bool use_default = field->has_default_value();
+
+    if (field->file()->syntax() == FileDescriptor::SYNTAX_PROTO3 &&
+        // Repeated fields get initialized to their default in the constructor
+        // (why?), so we emit a plain getField() call for them.
+        !field->is_repeated()) {
+      // Proto3 puts all defaults (including implicit defaults) in toObject().
+      // But for proto2 we leave the existing semantics unchanged: unset fields
+      // without default are unset.
+      use_default = true;
+    }
+    const std::string with_default = use_default ? "WithDefault" : "";
+    const std::string default_arg =
+        use_default ? StrCat(", ", JSFieldDefault(field)) : "";
+    const std::string cardinality = field->is_repeated() ? "Repeated" : "";
+
+    switch (field->cpp_type()) {
+      case FieldDescriptor::CPPTYPE_INT32:   // TYPE_INT32, TYPE_SINT32,
+                                             // TYPE_SFIXED32
+      case FieldDescriptor::CPPTYPE_UINT32:  // TYPE_UINT32,
+                                             // TYPE_FIXED32
+      {
+        /*
+         * JSON value will be a decimal number.
+         */
+        printer->Print(
+            "f = "
+            "jspb.Message.get$cardinality$$type$Field$with_default$($obj$, "
+            "$index$$default$);\n",
+            "cardinality", cardinality, "type", "", "with_default",
+            with_default, "obj", "this", "index", JSFieldIndex(field),
+            "default", default_arg);
+
+        GenerateJSONSerializeCondition(options, printer, field);
+        printer->Indent();
+        printer->Print("\nobj[\"$fieldname$\"] = f;", "fieldname", field_name);
+        printer->Outdent();
+        printer->Print("\n}");
+        break;
+      }
+      case FieldDescriptor::CPPTYPE_INT64:   // TYPE_INT64, TYPE_SINT64,
+                                             // TYPE_SFIXED64
+      case FieldDescriptor::CPPTYPE_UINT64:  // TYPE_UINT64,
+                                             // TYPE_FIXED64
+      {
+        /*
+         * JSON value will be a decimal string.
+         */
+        if (field->is_repeated()) {
+          printer->Print(
+              "f = jspb.Message.getRepeatedField$with_default$"
+              "(this, $index$$default$);\n",
+              "with_default", with_default, "index", JSFieldIndex(field),
+              "default", default_arg);
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = "
+              "jspb.Message.mapFieldList(f, function(elem) { return "
+              "elem.toString(); });",
+              "fieldname", field_name);
+          printer->Outdent();
+          printer->Print("\n}");
+        } else {
+          printer->Print(
+              "f = jspb.Message.getField$with_default$(this, "
+              "$index$$default$);\n",
+              "with_default", with_default, "index", JSFieldIndex(field),
+              "default", default_arg);
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print("\nobj[\"$fieldname$\"] = f.toString();", "fieldname",
+                         field_name);
+          printer->Outdent();
+          printer->Print("\n}");
+        }
+
+        break;
+      }
+
+      case FieldDescriptor::CPPTYPE_DOUBLE:   // TYPE_DOUBLE
+      case FieldDescriptor::CPPTYPE_FLOAT: {  // TYPE_FLOAT
+        /*
+         * JSON value will be a number or one of the special string values
+         * "NaN", "Infinity", and "-Infinity".
+         */
+        if (field->is_repeated()) {
+          printer->Print(
+              "f = "
+              "jspb.Message.get$cardinality$FloatingPointField$with_default$("
+              "this, $index$$default$);\n",
+              "cardinality", cardinality, "with_default", with_default, "index",
+              JSFieldIndex(field), "default", default_arg);
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = jspb.Message.mapFieldList(f, "
+              "function(elem) { return (isFinite(elem) ? elem : "
+              "elem.toString()); });",
+              "fieldname", field_name);
+          printer->Outdent();
+          printer->Print("\n}");
+        } else {
+          if (use_default) {
+            printer->Print(
+                "f = "
+                "jspb.Message.getFloatingPointFieldWithDefault(this, $index$$"
+                "default$);\n",
+                "index", JSFieldIndex(field), "default", default_arg);
+
+            GenerateJSONSerializeCondition(options, printer, field);
+            printer->Indent();
+            printer->Print(
+                "\nobj[\"$fieldname$\"] = (isFinite(f) ? f : f.toString());",
+                "fieldname", field_name);
+            printer->Outdent();
+            printer->Print("\n}");
+          } else {
+            printer->Print(
+                "f = jspb.Message.getOptionalFloatingPointField(this, "
+                "$index$$default$);\n",
+                "index", JSFieldIndex(field), "default", default_arg,
+                "default_val", JSFieldDefault(field));
+
+            GenerateJSONSerializeCondition(options, printer, field);
+            printer->Indent();
+            printer->Print(
+                "\nobj[\"$fieldname$\"] = (isFinite(f) ? f : f.toString());",
+                "fieldname", field_name);
+            printer->Outdent();
+            printer->Print("\n}");
+          }
+        }
+
+        break;
+      }
+      // TYPE_BOOL
+      case FieldDescriptor::CPPTYPE_BOOL: {
+        /*
+         * true or false only
+         */
+        printer->Print(
+            "f = "
+            "jspb.Message.get$cardinality$$type$Field$with_default$($obj$, "
+            "$index$$default$);\n",
+            "cardinality", cardinality, "type", "Boolean", "with_default",
+            with_default, "obj", "this", "index", JSFieldIndex(field),
+            "default", default_arg);
+
+        GenerateJSONSerializeCondition(options, printer, field);
+        printer->Indent();
+        printer->Print("\nobj[\"$fieldname$\"] = f;", "fieldname", field_name);
+        printer->Outdent();
+        printer->Print("\n}");
+        break;
+      }
+      // TYPE_ENUM
+      case FieldDescriptor::CPPTYPE_ENUM: {
+        const EnumDescriptor* enumdesc = field->enum_type();
+        /*
+         * The name of the enum value as specified in proto is used.
+         */
+        if (field->is_repeated()) {
+          printer->Print(
+              "f = jspb.Message.getRepeatedField$with_default$(this, "
+              "$index$$default$);\n",
+              "with_default", with_default, "index", JSFieldIndex(field),
+              "default", default_arg);
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = jspb.Message.mapFieldList(f, "
+              "function(elem) { return $enumprefix$$name$ByValue[elem] || "
+              "elem; });",
+              "fieldname", field_name, "enumprefix",
+              GetEnumPathPrefix(options, enumdesc), "name", enumdesc->name());
+          printer->Outdent();
+          printer->Print("\n}");
+        } else {
+          printer->Print("f = jspb.Message.getField(this, $index$);\n", "index",
+                         JSFieldIndex(field));
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = $enumprefix$$name$ByValue[f] || f;",
+              "fieldname", field_name, "enumprefix",
+              GetEnumPathPrefix(options, enumdesc), "name", enumdesc->name());
+          printer->Outdent();
+          printer->Print("\n}");
+        }
+
+        break;
+      }
+      // TYPE_STRING, TYPE_BYTES
+      case FieldDescriptor::CPPTYPE_STRING: {
+        /*
+         * TYPE_STRING:
+         * no transformation on the data, just ensure that it is a string data
+         * type. TYPE_BYTES: JSON value will be the data encoded as a string
+         * using standard base64 encoding with paddings.
+         */
+        const BytesMode byteMode =
+            (field->type() == FieldDescriptor::TYPE_STRING) ? BYTES_DEFAULT
+                                                            : BYTES_B64;
+        printer->Print("f = this.get$getter$();\n", "getter",
+                       JSGetterName(options, field, byteMode));
+
+        GenerateJSONSerializeCondition(options, printer, field);
+        printer->Indent();
+        printer->Print("\nobj[\"$fieldname$\"] = f;", "fieldname", field_name);
+        printer->Outdent();
+        printer->Print("\n}");
+
+        break;
+      }
+      // TYPE_MESSAGE, TYPE_GROUP
+      case FieldDescriptor::CPPTYPE_MESSAGE: {
+        if (field->is_map()) {
+          const FieldDescriptor* value_field = MapFieldValue(field);
+
+          const std::string simple_arg_xform =
+              (value_field->cpp_type() == FieldDescriptor::CPPTYPE_ENUM)
+                  ? GetEnumPathPrefix(options, value_field->enum_type()) +
+                        value_field->enum_type()->name() +
+                        std::string("ByValue[val] || val")
+                  : "val";
+
+          printer->Print("f = this.get$getter$();\n", "getter",
+                         JSGetterName(options, field));
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = f && f.toJSONObjectMap(function(pair) "
+              "{\n"
+              "  var val = pair[1];\n"
+              "  val = (typeof val.$tojsonobject$ === 'function') ? "
+              "         val.$tojsonobject$(includeDefaults) "
+              "         : $simple_xform$;\n"
+              "  return [pair[0], val];\n"
+              "}) || {};\n",
+              "fieldname", field_name, "tojsonobject",
+              options.json_to_object_name, "simple_xform", simple_arg_xform);
+          printer->Outdent();
+          printer->Print("\n}");
+        } else if (field->is_repeated()) {
+          printer->Print("f = this.get$getter$();\n", "getter",
+                         JSGetterName(options, field));
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = "
+              "jspb.Message.mapFieldList(f, function(elem) { "
+              "return "
+              "elem && elem.$tojsonobject$(includeDefaults); });",
+              "fieldname", field_name, "tojsonobject",
+              options.json_to_object_name);
+          printer->Outdent();
+          printer->Print("\n}");
+        } else {
+          printer->Print("f = this.get$getter$();\n", "getter",
+                         JSGetterName(options, field));
+
+          GenerateJSONSerializeCondition(options, printer, field);
+          printer->Indent();
+          printer->Print(
+              "\nobj[\"$fieldname$\"] = f && "
+              "f.$tojsonobject$(includeDefaults);",
+              "fieldname", field_name, "tojsonobject",
+              options.json_to_object_name);
+          printer->Outdent();
+          printer->Print("\n}");
+        }
+
+        break;
+      }
+      default: {
+        assert(false);
+        break;
+      }
+    }
+  };
+};
+
 void Generator::GenerateClass(const GeneratorOptions& options,
                               io::Printer* printer,
                               const Descriptor* desc) const {
@@ -2008,6 +2412,7 @@ void Generator::GenerateClass(const GeneratorOptions& options,
 
 
     GenerateClassToObject(options, printer, desc);
+    CanonicalJSONToObject::Generate(options, printer, desc);
     // These must come *before* the extension-field info generation in
     // GenerateClassRegistration so that references to the binary
     // serialization/deserialization functions may be placed in the extension
@@ -3383,6 +3788,54 @@ void Generator::GenerateEnum(const GeneratorOptions& options,
   printer->Print(
       "};\n"
       "\n");
+
+  GenerateEnumNameByValue(options, printer, enumdesc);
+}
+
+void Generator::GenerateEnumNameByValue(const GeneratorOptions& options,
+                             io::Printer* printer,
+                             const EnumDescriptor* enumdesc) const {
+  printer->Print(
+      "\n\n"
+      "if (jspb.Message.GENERATE_TO_JSON_OBJECT) {\n");
+
+  printer->Indent();
+  {
+    // TODO(amarkowitz): statically generated enums could be quite large leading to code bloat...  Might be
+    // better to generate this at runtime?
+    printer->Print(
+        "/**\n"
+        " * @enum {number}\n"
+        " * WARNING: Lookup of aliased enum by value will only resolve to the "
+        "latest declared enum value for a given number"
+        " */\n"
+        "$enumprefix$$name$ByValue = {\n",
+        "enumprefix", GetEnumPathPrefix(options, enumdesc), "name",
+        enumdesc->name());
+    printer->Annotate("name", enumdesc);
+
+    std::set<std::string> used_name;
+    std::vector<int> valid_index;
+    for (int i = 0; i < enumdesc->value_count(); i++) {
+      if (enumdesc->options().allow_alias() &&
+          !used_name.insert(ToEnumCase(enumdesc->value(i)->name())).second) {
+        continue;
+      }
+      valid_index.push_back(i);
+    }
+    for (auto i : valid_index) {
+      const EnumValueDescriptor* value = enumdesc->value(i);
+      printer->Print("  $value$: \"$name$\"$comma$\n", "name",
+                     ToEnumCase(value->name()), "value",
+                     StrCat(value->number()), "comma",
+                     (i == valid_index.back()) ? "" : ",");
+      printer->Annotate("name", value);
+    }
+
+    printer->Print("};\n");
+    printer->Outdent();
+  }
+  printer->Print("};\n");
 }
 
 void Generator::GenerateExtension(const GeneratorOptions& options,

@@ -86,7 +86,13 @@ struct GeneratorOptions {
         error_on_name_conflict(false),
         extension(".js"),
         one_output_file_per_input_file(false),
-        annotate_code(false) {}
+        annotate_code(false),
+        json_to_object_name(
+            "toJSONObject")  // warning: well_known_types_embed.cc uses string
+                             // literals without interpolation so if this value
+                             // is changed to a new name fixups will need to be
+                             // done in that file
+  {}
 
   bool ParseFromOptions(
       const std::vector<std::pair<std::string, std::string> >& options,
@@ -131,6 +137,8 @@ struct GeneratorOptions {
   // are enced as base64 proto of GeneratedCodeInfo message (see
   // descriptor.proto).
   bool annotate_code;
+  // the name of the function that will be used for generating the canonical json representation for a message
+  std::string json_to_object_name;
 };
 
 // CodeGenerator implementation which generates a JavaScript source file and
@@ -307,7 +315,10 @@ class PROTOC_EXPORT Generator : public CodeGenerator {
   // Generate definition for one enum.
   void GenerateEnum(const GeneratorOptions& options, io::Printer* printer,
                     const EnumDescriptor* enumdesc) const;
-
+  void GenerateEnumNameByValue(const GeneratorOptions& options,
+                               io::Printer* printer,
+                               const EnumDescriptor* enumdesc) const;
+                               
   // Generate an extension definition.
   void GenerateExtension(const GeneratorOptions& options, io::Printer* printer,
                          const FieldDescriptor* field) const;

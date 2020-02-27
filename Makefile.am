@@ -1183,6 +1183,7 @@ js_EXTRA_DIST=                                                         \
   js/maps_test.js                                                      \
   js/message.js                                                        \
   js/message_test.js                                                   \
+  js/json_test.js                                                      \
   js/node_loader.js                                                    \
   js/package.json                                                      \
   js/proto3_test.js                                                    \
@@ -1200,6 +1201,7 @@ js_EXTRA_DIST=                                                         \
   js/test13.proto                                                      \
   js/test14.proto                                                      \
   js/test15.proto                                                      \
+  js/testjson.proto                                                    \
   js/test_bootstrap.js                                                 \
   js/testbinary.proto                                                  \
   js/testempty.proto
